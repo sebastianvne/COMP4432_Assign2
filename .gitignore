@@ -10,3 +10,4 @@ src/__pycache__/
 feature/
 dataset/
 dataset_augmented/
+models/
