@@ -48,7 +48,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--color-weight", type=float, default=1.0)
     parser.add_argument("--bovw-weight", type=float, default=1.0)
     parser.add_argument("--metric", choices=["cosine", "euclidean"], default="cosine")
+    parser.add_argument("--classifier", choices=["knn", "svm"], default="knn")
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--eval-ks",
+        default=None,
+        help="用于扫描评估的 k 列表，例如 1,3,5,7；默认从 1 扫描到 --max-eval-k。",
+    )
+    parser.add_argument(
+        "--max-eval-k",
+        type=int,
+        default=10,
+        help="未指定 --eval-ks 时，评估 k 的最大值。",
+    )
+    parser.add_argument("--svm-kernel", choices=["linear", "rbf"], default="rbf")
+    parser.add_argument("--svm-c", type=float, default=1.0)
+    parser.add_argument(
+        "--svm-gamma",
+        default="scale",
+        help="SVM 的 gamma 参数，支持 scale、auto 或具体数值字符串。",
+    )
     return parser
 
 

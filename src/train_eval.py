@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
+from sklearn.svm import SVC
 
 
 def fuse_features(
@@ -80,7 +81,53 @@ def classify_by_knn(
     return np.asarray(predictions, dtype=np.int32)
 
 
-def evaluate_classification(
+def fit_svm_classifier(
+    train_embeddings: np.ndarray,
+    train_labels: Sequence[int],
+    kernel: str = "rbf",
+    c_value: float = 1.0,
+    gamma: str | float = "scale",
+) -> SVC:
+    parsed_gamma: str | float = gamma
+    if isinstance(gamma, str) and gamma not in {"scale", "auto"}:
+        parsed_gamma = float(gamma)
+    classifier = SVC(
+        kernel=kernel,
+        C=float(c_value),
+        gamma=parsed_gamma,
+        class_weight="balanced",
+        decision_function_shape="ovr",
+    )
+    classifier.fit(np.asarray(train_embeddings, dtype=np.float32), np.asarray(train_labels, dtype=np.int32))
+    return classifier
+
+
+def evaluate_predictions(
+    predictions: Sequence[int],
+    test_labels: Sequence[int],
+    extra: Dict[str, object] | None = None,
+) -> Dict[str, object]:
+    test_labels = np.asarray(test_labels, dtype=np.int32)
+    predictions = np.asarray(predictions, dtype=np.int32)
+    payload = dict(extra or {})
+    payload.update(
+        {
+            "accuracy": float(accuracy_score(test_labels, predictions)),
+            "macro_precision": float(
+                precision_score(test_labels, predictions, average="macro", zero_division=0)
+            ),
+            "macro_recall": float(
+                recall_score(test_labels, predictions, average="macro", zero_division=0)
+            ),
+            "macro_f1": float(f1_score(test_labels, predictions, average="macro")),
+            "confusion_matrix": confusion_matrix(test_labels, predictions).tolist(),
+            "predictions": predictions.tolist(),
+        }
+    )
+    return payload
+
+
+def evaluate_knn_classification(
     index: NearestNeighbors,
     train_labels: Sequence[int],
     test_embeddings: np.ndarray,
@@ -93,13 +140,51 @@ def evaluate_classification(
         query_embeddings=test_embeddings,
         top_k=top_k,
     )
-    test_labels = np.asarray(test_labels, dtype=np.int32)
-    return {
-        "accuracy": float(accuracy_score(test_labels, predictions)),
-        "macro_f1": float(f1_score(test_labels, predictions, average="macro")),
-        "confusion_matrix": confusion_matrix(test_labels, predictions).tolist(),
-        "predictions": predictions.tolist(),
-    }
+    return evaluate_predictions(
+        predictions=predictions,
+        test_labels=test_labels,
+        extra={"classifier": "knn", "top_k": int(top_k)},
+    )
+
+
+def evaluate_svm_classification(
+    classifier: SVC,
+    test_embeddings: np.ndarray,
+    test_labels: Sequence[int],
+) -> Dict[str, object]:
+    predictions = classifier.predict(np.asarray(test_embeddings, dtype=np.float32))
+    return evaluate_predictions(
+        predictions=predictions,
+        test_labels=test_labels,
+        extra={"classifier": "svm"},
+    )
+
+
+def evaluate_classification(
+    classifier_name: str,
+    index: NearestNeighbors,
+    train_labels: Sequence[int],
+    test_embeddings: np.ndarray,
+    test_labels: Sequence[int],
+    top_k: int,
+    svm_classifier: SVC | None = None,
+) -> Dict[str, object]:
+    if classifier_name == "svm":
+        if svm_classifier is None:
+            raise ValueError("classifier_name=svm 时必须提供 svm_classifier。")
+        return evaluate_svm_classification(
+            classifier=svm_classifier,
+            test_embeddings=test_embeddings,
+            test_labels=test_labels,
+        )
+
+    return evaluate_knn_classification(
+        index=index,
+        train_labels=train_labels,
+        test_embeddings=test_embeddings,
+        test_labels=test_labels,
+        top_k=top_k,
+    )
 
 
 def compute_mean_average_precision(
@@ -164,13 +249,14 @@ def build_prediction_payload(
     query_embedding: np.ndarray,
     top_k: int,
     metric: str = "cosine",
+    predicted_label: int | None = None,
 ) -> Dict[str, object]:
     distances, indices = retrieve_neighbors(index, query_embedding, top_k=top_k)
     distances = distances[0]
     indices = indices[0]
 
     neighbor_labels = [int(train_labels[idx]) for idx in indices]
-    prediction = majority_vote(neighbor_labels)
+    prediction = int(predicted_label) if predicted_label is not None else majority_vote(neighbor_labels)
 
     neighbors = []
     for idx, distance in zip(indices, distances):
