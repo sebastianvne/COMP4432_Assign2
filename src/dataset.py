@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -35,20 +35,21 @@ def load_samples(csv_path: Path | str, project_root: Path | None = None) -> List
     samples: List[SampleRecord] = []
     with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
-        required = {"path", "label", "time", "cn_name"}
+        required = {"path", "label"}
         missing = required.difference(reader.fieldnames or [])
         if missing:
             raise ValueError(f"dataset.csv 缺少字段: {sorted(missing)}")
 
         for row in reader:
             image_path = resolve_sample_path(project_root, row["path"])
+            cn_name = row.get("cn_name") or Path(row["path"]).parent.name or str(row["label"])
             samples.append(
                 SampleRecord(
                     path=image_path,
                     relative_path=row["path"],
                     label=int(row["label"]),
-                    time=row["time"],
-                    cn_name=row["cn_name"],
+                    time=row.get("time", ""),
+                    cn_name=cn_name,
                 )
             )
 
@@ -83,8 +84,23 @@ def stratified_split(
     if not 0.0 < test_size < 1.0:
         raise ValueError("test_size 必须在 0 和 1 之间。")
 
-    indices = list(range(len(samples)))
-    labels = [sample.label for sample in samples]
+    label_groups: Dict[int, List[SampleRecord]] = defaultdict(list)
+    for sample in samples:
+        label_groups[sample.label].append(sample)
+
+    rare_train_only: List[SampleRecord] = []
+    splittable_samples: List[SampleRecord] = []
+    for group in label_groups.values():
+        if len(group) < 2:
+            rare_train_only.extend(group)
+        else:
+            splittable_samples.extend(group)
+
+    if not splittable_samples:
+        raise ValueError("没有可用于训练/测试划分的类别；至少需要一个类别包含 2 张及以上图片。")
+
+    indices = list(range(len(splittable_samples)))
+    labels = [sample.label for sample in splittable_samples]
 
     train_indices, test_indices = train_test_split(
         indices,
@@ -94,6 +110,6 @@ def stratified_split(
         stratify=labels,
     )
 
-    train_samples = [samples[index] for index in train_indices]
-    test_samples = [samples[index] for index in test_indices]
+    train_samples = [splittable_samples[index] for index in train_indices] + rare_train_only
+    test_samples = [splittable_samples[index] for index in test_indices]
     return train_samples, test_samples
