@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--color-weight", type=float, default=1.0)
     parser.add_argument("--bovw-weight", type=float, default=1.0)
     parser.add_argument("--metric", choices=["cosine", "euclidean"], default="cosine")
-    parser.add_argument("--classifier", choices=["knn", "svm"], default="knn")
+    parser.add_argument("--classifier", choices=["knn", "svm", "rf", "ensemble"], default="knn")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
         "--eval-ks",
@@ -68,6 +68,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="scale",
         help="SVM 的 gamma 参数，支持 scale、auto 或具体数值字符串。",
     )
+    parser.add_argument("--rf-n-estimators", type=int, default=300)
+    parser.add_argument("--rf-max-depth", type=int, default=None)
+    parser.add_argument("--rf-min-samples-leaf", type=int, default=1)
     return parser
 
 

@@ -58,11 +58,18 @@ def compute_center_weights(
     height, width = image_shape[:2]
     center_x = width / 2.0
     center_y = height / 2.0
+    if isinstance(keypoints, np.ndarray):
+        keypoint_points = np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
+    else:
+        keypoint_points = np.array(
+            [keypoint.pt for keypoint in keypoints],
+            dtype=np.float32,
+        ).reshape(-1, 2)
 
     distances = np.array(
         [
-            np.hypot(keypoint.pt[0] - center_x, keypoint.pt[1] - center_y)
-            for keypoint in keypoints
+            np.hypot(point[0] - center_x, point[1] - center_y)
+            for point in keypoint_points
         ],
         dtype=np.float32,
     )

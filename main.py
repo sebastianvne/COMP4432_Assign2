@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
@@ -22,7 +23,9 @@ from src.train_eval import (
     build_prediction_payload,
     evaluate_classification,
     evaluate_retrieval,
+    fit_rf_classifier,
     fit_knn_index,
+    predict_labels_by_classifier,
     fit_svm_classifier,
     fuse_features,
     save_json,
@@ -34,34 +37,98 @@ def resolve_path(project_root: Path, raw_path: str) -> Path:
     return path if path.is_absolute() else (project_root / path).resolve()
 
 
-def extract_records(samples, args) -> List[Dict[str, object]]:
+def keypoints_to_points(keypoints: Sequence) -> np.ndarray:
+    if not keypoints:
+        return np.zeros((0, 2), dtype=np.float32)
+    points = np.array([keypoint.pt for keypoint in keypoints], dtype=np.float32)
+    return points.reshape(-1, 2)
+
+
+def build_feature_cache_signature(sample, args) -> str:
+    file_stat = sample.path.stat()
+    payload = {
+        "path": sample.relative_path,
+        "size": int(file_stat.st_size),
+        "mtime_ns": int(file_stat.st_mtime_ns),
+        "max_side": int(args.max_side),
+        "grabcut_margin_ratio": float(args.grabcut_margin_ratio),
+        "grabcut_iter_count": int(args.grabcut_iter_count),
+        "h_bins": int(args.h_bins),
+        "s_bins": int(args.s_bins),
+        "sift_nfeatures": int(args.sift_nfeatures),
+        "sift_contrast_threshold": float(args.sift_contrast_threshold),
+        "sift_edge_threshold": float(args.sift_edge_threshold),
+        "sift_sigma": float(args.sift_sigma),
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()
+
+
+def build_feature_cache_path(project_root: Path, sample, args) -> Path:
+    cache_dir = project_root / "feature"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{build_feature_cache_signature(sample, args)}.joblib"
+
+
+def extract_or_load_record(project_root: Path, sample, args) -> tuple[Dict[str, object], bool]:
+    cache_path = build_feature_cache_path(project_root, sample, args)
+    if cache_path.exists():
+        cached = joblib.load(cache_path)
+        record = {
+            "sample": sample,
+            "color_hist": np.asarray(cached["color_hist"], dtype=np.float32),
+            "keypoints": np.asarray(cached["keypoints"], dtype=np.float32).reshape(-1, 2),
+            "descriptors": np.asarray(cached["descriptors"], dtype=np.float32).reshape(-1, 128),
+            "image_shape": tuple(cached["image_shape"]),
+        }
+        return record, True
+
+    preprocess_result = preprocess_image(
+        sample.path,
+        max_side=args.max_side,
+        grabcut_margin_ratio=args.grabcut_margin_ratio,
+        grabcut_iter_count=args.grabcut_iter_count,
+    )
+    feature_bundle = extract_feature_bundle(
+        preprocess_result.image_bgr,
+        foreground_mask=preprocess_result.foreground_mask,
+        h_bins=args.h_bins,
+        s_bins=args.s_bins,
+        sift_nfeatures=args.sift_nfeatures,
+        sift_contrast_threshold=args.sift_contrast_threshold,
+        sift_edge_threshold=args.sift_edge_threshold,
+        sift_sigma=args.sift_sigma,
+    )
+    keypoint_points = keypoints_to_points(feature_bundle.keypoints)
+    record = {
+        "sample": sample,
+        "color_hist": feature_bundle.color_hist.astype(np.float32, copy=False),
+        "keypoints": keypoint_points,
+        "descriptors": feature_bundle.descriptors.astype(np.float32, copy=False),
+        "image_shape": feature_bundle.image_shape,
+    }
+    joblib.dump(
+        {
+            "path": sample.relative_path,
+            "color_hist": record["color_hist"],
+            "keypoints": record["keypoints"],
+            "descriptors": record["descriptors"],
+            "image_shape": record["image_shape"],
+        },
+        cache_path,
+    )
+    return record, False
+
+
+def extract_records(samples, args, project_root: Path) -> List[Dict[str, object]]:
     records: List[Dict[str, object]] = []
+    cache_hits = 0
     for sample in tqdm(samples, desc="提取图像特征", unit="img"):
-        preprocess_result = preprocess_image(
-            sample.path,
-            max_side=args.max_side,
-            grabcut_margin_ratio=args.grabcut_margin_ratio,
-            grabcut_iter_count=args.grabcut_iter_count,
-        )
-        feature_bundle = extract_feature_bundle(
-            preprocess_result.image_bgr,
-            foreground_mask=preprocess_result.foreground_mask,
-            h_bins=args.h_bins,
-            s_bins=args.s_bins,
-            sift_nfeatures=args.sift_nfeatures,
-            sift_contrast_threshold=args.sift_contrast_threshold,
-            sift_edge_threshold=args.sift_edge_threshold,
-            sift_sigma=args.sift_sigma,
-        )
-        records.append(
-            {
-                "sample": sample,
-                "color_hist": feature_bundle.color_hist,
-                "keypoints": feature_bundle.keypoints,
-                "descriptors": feature_bundle.descriptors,
-                "image_shape": feature_bundle.image_shape,
-            }
-        )
+        record, loaded_from_cache = extract_or_load_record(project_root, sample, args)
+        cache_hits += int(loaded_from_cache)
+        records.append(record)
+    cache_misses = len(samples) - cache_hits
+    print(f"特征缓存命中: {cache_hits} | 新提取: {cache_misses} | 缓存目录: {project_root / 'feature'}")
     return records
 
 
@@ -257,7 +324,7 @@ def save_training_outputs(
     metrics: Dict[str, object],
     label_to_name: Dict[int, str],
     args,
-    classifier_artifact=None,
+    classifier_artifacts: Dict[str, object] | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -288,7 +355,7 @@ def save_training_outputs(
         "train_paths": train_paths,
         "label_to_name": {int(k): v for k, v in label_to_name.items()},
         "classifier_name": args.classifier,
-        "classifier_artifact": classifier_artifact,
+        "classifier_artifacts": classifier_artifacts or {},
         "config": vars(args),
     }
     model_path = output_dir / "model_bundle.joblib"
@@ -317,7 +384,7 @@ def run_train(args) -> None:
     print(f"数据划分已保存到: {output_dir / 'partition'}")
 
     print("正在提取训练集特征...")
-    train_records = extract_records(train_samples, args)
+    train_records = extract_records(train_samples, args, project_root=project_root)
     print("正在训练视觉词典...")
     kmeans = train_visual_vocabulary(
         descriptor_sets=[record["descriptors"] for record in train_records],
@@ -346,7 +413,7 @@ def run_train(args) -> None:
     )
 
     print("正在提取测试集特征...")
-    test_records = extract_records(test_samples, args)
+    test_records = extract_records(test_samples, args, project_root=project_root)
     test_bovw_features = encode_bovw_batch(
         descriptor_sets=[record["descriptors"] for record in test_records],
         keypoint_sets=[record["keypoints"] for record in test_records],
@@ -369,7 +436,7 @@ def run_train(args) -> None:
     test_labels = [record["sample"].label for record in test_records]
 
     svm_classifier = None
-    if args.classifier == "svm":
+    if args.classifier in {"svm", "ensemble"}:
         print("正在训练 SVM 分类器...")
         svm_classifier = fit_svm_classifier(
             train_embeddings=train_embeddings,
@@ -377,6 +444,17 @@ def run_train(args) -> None:
             kernel=args.svm_kernel,
             c_value=args.svm_c,
             gamma=args.svm_gamma,
+        )
+    rf_classifier = None
+    if args.classifier in {"rf", "ensemble"}:
+        print("正在训练 Random Forest 分类器...")
+        rf_classifier = fit_rf_classifier(
+            train_embeddings=train_embeddings,
+            train_labels=train_labels,
+            n_estimators=args.rf_n_estimators,
+            max_depth=args.rf_max_depth,
+            min_samples_leaf=args.rf_min_samples_leaf,
+            random_state=args.random_state,
         )
 
     classification_metrics = evaluate_classification(
@@ -387,6 +465,7 @@ def run_train(args) -> None:
         test_labels=test_labels,
         top_k=args.top_k,
         svm_classifier=svm_classifier,
+        rf_classifier=rf_classifier,
     )
     retrieval_metrics = evaluate_retrieval(
         index=knn_index,
@@ -412,13 +491,11 @@ def run_train(args) -> None:
         save_k_sweep_csv(k_sweep_metrics["per_k"], output_dir / "k_sweep_metrics.csv")
         plot_k_sweep(k_sweep_metrics["per_k"], output_dir / "k_sweep_accuracy_recall.png")
 
+    classification_predictions = np.asarray(classification_metrics["predictions"], dtype=np.int32)
     retrieval_examples = []
-    for record, query_embedding in zip(test_records, test_embeddings):
-        predicted_label = None
-        if args.classifier == "svm" and svm_classifier is not None:
-            predicted_label = int(
-                svm_classifier.predict(np.asarray(query_embedding, dtype=np.float32)[None, :])[0]
-            )
+    for record, query_embedding, predicted_label in zip(
+        test_records, test_embeddings, classification_predictions
+    ):
         prediction = build_prediction_payload(
             index=knn_index,
             train_embeddings=train_embeddings,
@@ -428,7 +505,7 @@ def run_train(args) -> None:
             query_embedding=query_embedding,
             top_k=args.top_k,
             metric=args.metric,
-            predicted_label=predicted_label,
+            predicted_label=int(predicted_label),
         )
         retrieval_examples.append(
             {
@@ -455,7 +532,7 @@ def run_train(args) -> None:
     else:
         metrics["k_sweep"] = {
             "enabled": False,
-            "reason": "当前分类器为 svm，k-sweep 仅适用于 knn 分类。",
+            "reason": f"当前分类器为 {args.classifier}，k-sweep 仅适用于 knn 分类。",
         }
 
     model_path = save_training_outputs(
@@ -470,7 +547,11 @@ def run_train(args) -> None:
         metrics=metrics,
         label_to_name=label_to_name,
         args=args,
-        classifier_artifact=svm_classifier,
+        classifier_artifacts={
+            name: artifact
+            for name, artifact in {"svm": svm_classifier, "rf": rf_classifier}.items()
+            if artifact is not None
+        },
     )
     save_json({"examples": retrieval_examples}, output_dir / "retrieval_examples.json")
 
@@ -494,7 +575,11 @@ def run_predict(args) -> None:
     train_paths = bundle["train_paths"]
     label_to_name = {int(k): v for k, v in bundle["label_to_name"].items()}
     classifier_name = bundle.get("classifier_name", "knn")
-    classifier_artifact = bundle.get("classifier_artifact")
+    classifier_artifacts = bundle.get("classifier_artifacts", {})
+    if not classifier_artifacts:
+        legacy_artifact = bundle.get("classifier_artifact")
+        if legacy_artifact is not None and classifier_name == "svm":
+            classifier_artifacts = {"svm": legacy_artifact}
 
     namespace = argparse.Namespace(**config)
     preprocess_result = preprocess_image(
@@ -528,9 +613,17 @@ def run_predict(args) -> None:
         bovw_weight=namespace.bovw_weight,
     )
     knn_index = fit_knn_index(train_embeddings, metric=namespace.metric)
-    predicted_label = None
-    if classifier_name == "svm" and classifier_artifact is not None:
-        predicted_label = int(classifier_artifact.predict(np.asarray(embedding, dtype=np.float32))[0])
+    predicted_label = int(
+        predict_labels_by_classifier(
+            classifier_name=classifier_name,
+            index=knn_index,
+            train_labels=train_labels,
+            query_embeddings=embedding,
+            top_k=args.top_k,
+            svm_classifier=classifier_artifacts.get("svm"),
+            rf_classifier=classifier_artifacts.get("rf"),
+        )[0]
+    )
     prediction = build_prediction_payload(
         index=knn_index,
         train_embeddings=train_embeddings,
@@ -571,7 +664,11 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--color-weight", type=float, default=1.0)
     train_parser.add_argument("--bovw-weight", type=float, default=1.0)
     train_parser.add_argument("--metric", choices=["cosine", "euclidean"], default="cosine")
-    train_parser.add_argument("--classifier", choices=["knn", "svm"], default="knn")
+    train_parser.add_argument(
+        "--classifier",
+        choices=["knn", "svm", "rf", "ensemble"],
+        default="knn",
+    )
     train_parser.add_argument("--top-k", type=int, default=5)
     train_parser.add_argument(
         "--eval-ks",
@@ -591,6 +688,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="scale",
         help="SVM 的 gamma 参数，支持 scale、auto 或具体数值字符串。",
     )
+    train_parser.add_argument("--rf-n-estimators", type=int, default=300)
+    train_parser.add_argument("--rf-max-depth", type=int, default=None)
+    train_parser.add_argument("--rf-min-samples-leaf", type=int, default=1)
     train_parser.set_defaults(func=run_train)
 
     predict_parser = subparsers.add_parser("predict", help="加载模型并预测单张图片")

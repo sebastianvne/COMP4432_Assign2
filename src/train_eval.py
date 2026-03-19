@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 from sklearn.svm import SVC
@@ -102,6 +103,34 @@ def fit_svm_classifier(
     return classifier
 
 
+def fit_rf_classifier(
+    train_embeddings: np.ndarray,
+    train_labels: Sequence[int],
+    n_estimators: int = 300,
+    max_depth: int | None = None,
+    min_samples_leaf: int = 1,
+    random_state: int = 42,
+) -> RandomForestClassifier:
+    classifier = RandomForestClassifier(
+        n_estimators=int(n_estimators),
+        max_depth=max_depth,
+        min_samples_leaf=int(min_samples_leaf),
+        class_weight="balanced",
+        random_state=int(random_state),
+        n_jobs=-1,
+    )
+    classifier.fit(np.asarray(train_embeddings, dtype=np.float32), np.asarray(train_labels, dtype=np.int32))
+    return classifier
+
+
+def vote_predictions(prediction_groups: Sequence[Sequence[int]]) -> np.ndarray:
+    if not prediction_groups:
+        raise ValueError("至少需要一组预测结果才能执行投票。")
+    stacked = np.vstack([np.asarray(group, dtype=np.int32) for group in prediction_groups])
+    voted = [majority_vote(stacked[:, idx].tolist()) for idx in range(stacked.shape[1])]
+    return np.asarray(voted, dtype=np.int32)
+
+
 def evaluate_predictions(
     predictions: Sequence[int],
     test_labels: Sequence[int],
@@ -160,6 +189,92 @@ def evaluate_svm_classification(
     )
 
 
+def evaluate_rf_classification(
+    classifier: RandomForestClassifier,
+    test_embeddings: np.ndarray,
+    test_labels: Sequence[int],
+) -> Dict[str, object]:
+    predictions = classifier.predict(np.asarray(test_embeddings, dtype=np.float32))
+    return evaluate_predictions(
+        predictions=predictions,
+        test_labels=test_labels,
+        extra={"classifier": "rf"},
+    )
+
+
+def evaluate_ensemble_classification(
+    index: NearestNeighbors,
+    train_labels: Sequence[int],
+    test_embeddings: np.ndarray,
+    test_labels: Sequence[int],
+    top_k: int,
+    svm_classifier: SVC,
+    rf_classifier: RandomForestClassifier,
+) -> Dict[str, object]:
+    knn_predictions = classify_by_knn(
+        index=index,
+        train_labels=train_labels,
+        query_embeddings=test_embeddings,
+        top_k=top_k,
+    )
+    svm_predictions = svm_classifier.predict(np.asarray(test_embeddings, dtype=np.float32))
+    rf_predictions = rf_classifier.predict(np.asarray(test_embeddings, dtype=np.float32))
+    predictions = vote_predictions([knn_predictions, svm_predictions, rf_predictions])
+    return evaluate_predictions(
+        predictions=predictions,
+        test_labels=test_labels,
+        extra={
+            "classifier": "ensemble",
+            "members": ["knn", "svm", "rf"],
+            "top_k": int(top_k),
+        },
+    )
+
+
+def predict_labels_by_classifier(
+    classifier_name: str,
+    index: NearestNeighbors,
+    train_labels: Sequence[int],
+    query_embeddings: np.ndarray,
+    top_k: int,
+    svm_classifier: SVC | None = None,
+    rf_classifier: RandomForestClassifier | None = None,
+) -> np.ndarray:
+    query_embeddings = np.asarray(query_embeddings, dtype=np.float32)
+    if query_embeddings.ndim == 1:
+        query_embeddings = query_embeddings[None, :]
+
+    if classifier_name == "svm":
+        if svm_classifier is None:
+            raise ValueError("classifier_name=svm 时必须提供 svm_classifier。")
+        return np.asarray(svm_classifier.predict(query_embeddings), dtype=np.int32)
+
+    if classifier_name == "rf":
+        if rf_classifier is None:
+            raise ValueError("classifier_name=rf 时必须提供 rf_classifier。")
+        return np.asarray(rf_classifier.predict(query_embeddings), dtype=np.int32)
+
+    if classifier_name == "ensemble":
+        if svm_classifier is None or rf_classifier is None:
+            raise ValueError("classifier_name=ensemble 时必须同时提供 svm_classifier 和 rf_classifier。")
+        knn_predictions = classify_by_knn(
+            index=index,
+            train_labels=train_labels,
+            query_embeddings=query_embeddings,
+            top_k=top_k,
+        )
+        svm_predictions = np.asarray(svm_classifier.predict(query_embeddings), dtype=np.int32)
+        rf_predictions = np.asarray(rf_classifier.predict(query_embeddings), dtype=np.int32)
+        return vote_predictions([knn_predictions, svm_predictions, rf_predictions])
+
+    return classify_by_knn(
+        index=index,
+        train_labels=train_labels,
+        query_embeddings=query_embeddings,
+        top_k=top_k,
+    )
+
+
 def evaluate_classification(
     classifier_name: str,
     index: NearestNeighbors,
@@ -168,6 +283,7 @@ def evaluate_classification(
     test_labels: Sequence[int],
     top_k: int,
     svm_classifier: SVC | None = None,
+    rf_classifier: RandomForestClassifier | None = None,
 ) -> Dict[str, object]:
     if classifier_name == "svm":
         if svm_classifier is None:
@@ -176,6 +292,28 @@ def evaluate_classification(
             classifier=svm_classifier,
             test_embeddings=test_embeddings,
             test_labels=test_labels,
+        )
+
+    if classifier_name == "rf":
+        if rf_classifier is None:
+            raise ValueError("classifier_name=rf 时必须提供 rf_classifier。")
+        return evaluate_rf_classification(
+            classifier=rf_classifier,
+            test_embeddings=test_embeddings,
+            test_labels=test_labels,
+        )
+
+    if classifier_name == "ensemble":
+        if svm_classifier is None or rf_classifier is None:
+            raise ValueError("classifier_name=ensemble 时必须同时提供 svm_classifier 和 rf_classifier。")
+        return evaluate_ensemble_classification(
+            index=index,
+            train_labels=train_labels,
+            test_embeddings=test_embeddings,
+            test_labels=test_labels,
+            top_k=top_k,
+            svm_classifier=svm_classifier,
+            rf_classifier=rf_classifier,
         )
 
     return evaluate_knn_classification(
