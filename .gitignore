@@ -7,4 +7,4 @@ src/__pycache__/
 *.pyo
 .ipynb_checkpoints/
 /dataset_large_jpg/
-/feature/
+feature/
