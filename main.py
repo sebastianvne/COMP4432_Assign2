@@ -4,8 +4,28 @@ import argparse
 import csv
 import hashlib
 import json
+import multiprocessing as mp
+import os
+from concurrent.futures import ProcessPoolExecutor
+from itertools import repeat
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
+
+
+def sanitize_omp_num_threads() -> None:
+    raw_value = os.environ.get("OMP_NUM_THREADS")
+    if raw_value is None:
+        return
+    try:
+        if int(raw_value) > 0:
+            return
+    except ValueError:
+        pass
+    os.environ["OMP_NUM_THREADS"] = "1"
+
+
+sanitize_omp_num_threads()
+
 
 import joblib
 import matplotlib
@@ -15,21 +35,24 @@ from tqdm.auto import tqdm
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from src.bovw import encode_bovw_batch, encode_weighted_bovw, save_artifact, train_visual_vocabulary
+from src.bovw import encode_bovw_batch, save_artifact, train_visual_vocabulary
 from src.dataset import build_label_to_name, load_samples, stratified_split, summarize_labels
-from src.features import extract_feature_bundle
+from src.features import extract_feature_bundle, resolve_sift_backend
 from src.preprocess import preprocess_image
 from src.train_eval import (
+    build_knn_index,
     build_prediction_payload,
     evaluate_classification,
     evaluate_retrieval,
     fit_rf_classifier,
-    fit_knn_index,
     predict_labels_by_classifier,
     fit_svm_classifier,
     fuse_features,
+    retrieve_neighbors,
     save_json,
 )
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif"}
 
 
 def resolve_path(project_root: Path, raw_path: str) -> Path:
@@ -37,7 +60,13 @@ def resolve_path(project_root: Path, raw_path: str) -> Path:
     return path if path.is_absolute() else (project_root / path).resolve()
 
 
+def default_num_workers() -> int:
+    return max(1, min(4, os.cpu_count() or 1))
+
+
 def keypoints_to_points(keypoints: Sequence) -> np.ndarray:
+    if isinstance(keypoints, np.ndarray):
+        return np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
     if not keypoints:
         return np.zeros((0, 2), dtype=np.float32)
     points = np.array([keypoint.pt for keypoint in keypoints], dtype=np.float32)
@@ -51,14 +80,17 @@ def build_feature_cache_signature(sample, args) -> str:
         "size": int(file_stat.st_size),
         "mtime_ns": int(file_stat.st_mtime_ns),
         "max_side": int(args.max_side),
-        "grabcut_margin_ratio": float(args.grabcut_margin_ratio),
-        "grabcut_iter_count": int(args.grabcut_iter_count),
         "h_bins": int(args.h_bins),
         "s_bins": int(args.s_bins),
         "sift_nfeatures": int(args.sift_nfeatures),
         "sift_contrast_threshold": float(args.sift_contrast_threshold),
         "sift_edge_threshold": float(args.sift_edge_threshold),
         "sift_sigma": float(args.sift_sigma),
+        "sift_backend": str(getattr(args, "sift_backend", "opencv")),
+        "cudasift_max_points": int(getattr(args, "cudasift_max_points", 32768)),
+        "cudasift_num_octaves": int(getattr(args, "cudasift_num_octaves", 5)),
+        "cudasift_lowest_scale": float(getattr(args, "cudasift_lowest_scale", 0.0)),
+        "cudasift_upscale": bool(getattr(args, "cudasift_upscale", False)),
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
     return hashlib.sha1(encoded).hexdigest()
@@ -68,6 +100,22 @@ def build_feature_cache_path(project_root: Path, sample, args) -> Path:
     cache_dir = project_root / "feature"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / f"{build_feature_cache_signature(sample, args)}.joblib"
+
+
+def should_use_spawn_for_feature_workers(config) -> bool:
+    backend = getattr(config, "sift_backend", "opencv")
+    try:
+        resolved_backend = resolve_sift_backend(backend)
+    except Exception:
+        resolved_backend = str(backend).lower()
+    return resolved_backend == "cudasift"
+
+
+def effective_feature_worker_count(config, requested_workers: int) -> int:
+    requested_workers = max(1, int(requested_workers))
+    if should_use_spawn_for_feature_workers(config):
+        return 1
+    return requested_workers
 
 
 def extract_or_load_record(project_root: Path, sample, args) -> tuple[Dict[str, object], bool]:
@@ -86,18 +134,20 @@ def extract_or_load_record(project_root: Path, sample, args) -> tuple[Dict[str, 
     preprocess_result = preprocess_image(
         sample.path,
         max_side=args.max_side,
-        grabcut_margin_ratio=args.grabcut_margin_ratio,
-        grabcut_iter_count=args.grabcut_iter_count,
     )
     feature_bundle = extract_feature_bundle(
         preprocess_result.image_bgr,
-        foreground_mask=preprocess_result.foreground_mask,
         h_bins=args.h_bins,
         s_bins=args.s_bins,
         sift_nfeatures=args.sift_nfeatures,
         sift_contrast_threshold=args.sift_contrast_threshold,
         sift_edge_threshold=args.sift_edge_threshold,
         sift_sigma=args.sift_sigma,
+        sift_backend=args.sift_backend,
+        cudasift_max_points=args.cudasift_max_points,
+        cudasift_num_octaves=args.cudasift_num_octaves,
+        cudasift_lowest_scale=args.cudasift_lowest_scale,
+        cudasift_upscale=args.cudasift_upscale,
     )
     keypoint_points = keypoints_to_points(feature_bundle.keypoints)
     record = {
@@ -120,19 +170,50 @@ def extract_or_load_record(project_root: Path, sample, args) -> tuple[Dict[str, 
     return record, False
 
 
+def _extract_record_task(project_root: Path, sample, args) -> tuple[Dict[str, object], bool]:
+    return extract_or_load_record(project_root, sample, args)
+
+
 def extract_records(samples, args, project_root: Path) -> List[Dict[str, object]]:
     records: List[Dict[str, object]] = []
     cache_hits = 0
-    for sample in tqdm(samples, desc="提取图像特征", unit="img"):
-        record, loaded_from_cache = extract_or_load_record(project_root, sample, args)
-        cache_hits += int(loaded_from_cache)
-        records.append(record)
+    requested_workers = max(1, int(getattr(args, "num_workers", 1)))
+    num_workers = effective_feature_worker_count(args, requested_workers)
+    chunksize = max(1, int(getattr(args, "chunksize", 1)))
+
+    if num_workers != requested_workers:
+        print(
+            f"检测到 cudasift 后端，特征提取 worker 从 {requested_workers} 调整为 {num_workers}，"
+            "避免多进程同时占用 GPU 导致显存溢出。"
+        )
+
+    if num_workers == 1 or len(samples) <= 1:
+        for sample in tqdm(samples, desc="提取图像特征", unit="img"):
+            record, loaded_from_cache = extract_or_load_record(project_root, sample, args)
+            cache_hits += int(loaded_from_cache)
+            records.append(record)
+    else:
+        executor_kwargs = {"max_workers": num_workers}
+        if should_use_spawn_for_feature_workers(args):
+            executor_kwargs["mp_context"] = mp.get_context("spawn")
+        with ProcessPoolExecutor(**executor_kwargs) as executor:
+            iterator = executor.map(
+                _extract_record_task,
+                repeat(project_root),
+                samples,
+                repeat(args),
+                chunksize=chunksize,
+            )
+            for record, loaded_from_cache in tqdm(iterator, total=len(samples), desc="提取图像特征", unit="img"):
+                cache_hits += int(loaded_from_cache)
+                records.append(record)
+
     cache_misses = len(samples) - cache_hits
     print(f"特征缓存命中: {cache_hits} | 新提取: {cache_misses} | 缓存目录: {project_root / 'feature'}")
     return records
 
 
-def build_embeddings(records, vocabulary: np.ndarray, args) -> np.ndarray:
+def build_feature_matrices(records, vocabulary: np.ndarray, args) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     color_features = np.vstack([record["color_hist"] for record in records]).astype(np.float32)
     bovw_features = encode_bovw_batch(
         descriptor_sets=[record["descriptors"] for record in records],
@@ -141,6 +222,11 @@ def build_embeddings(records, vocabulary: np.ndarray, args) -> np.ndarray:
         vocabulary=vocabulary,
         min_weight=args.min_spatial_weight,
         max_weight=args.max_spatial_weight,
+        num_workers=getattr(args, "num_workers", 1),
+        chunksize=getattr(args, "chunksize", 8),
+        backend=getattr(args, "bovw_backend", "numpy"),
+        torch_device=getattr(args, "torch_device", "auto"),
+        descriptor_chunk_size=getattr(args, "torch_descriptor_chunk_size", 8192),
     )
     embeddings = fuse_features(
         color_features=color_features,
@@ -148,7 +234,87 @@ def build_embeddings(records, vocabulary: np.ndarray, args) -> np.ndarray:
         color_weight=args.color_weight,
         bovw_weight=args.bovw_weight,
     )
+    return color_features, bovw_features, embeddings
+
+
+def build_embeddings(records, vocabulary: np.ndarray, args) -> np.ndarray:
+    _, _, embeddings = build_feature_matrices(records, vocabulary=vocabulary, args=args)
     return embeddings
+
+
+def extract_query_record(image_path: Path, config) -> Dict[str, object]:
+    preprocess_result = preprocess_image(
+        image_path,
+        max_side=config.max_side,
+    )
+    feature_bundle = extract_feature_bundle(
+        preprocess_result.image_bgr,
+        h_bins=config.h_bins,
+        s_bins=config.s_bins,
+        sift_nfeatures=config.sift_nfeatures,
+        sift_contrast_threshold=config.sift_contrast_threshold,
+        sift_edge_threshold=config.sift_edge_threshold,
+        sift_sigma=config.sift_sigma,
+        sift_backend=getattr(config, "sift_backend", "opencv"),
+        cudasift_max_points=getattr(config, "cudasift_max_points", 32768),
+        cudasift_num_octaves=getattr(config, "cudasift_num_octaves", 5),
+        cudasift_lowest_scale=getattr(config, "cudasift_lowest_scale", 0.0),
+        cudasift_upscale=getattr(config, "cudasift_upscale", False),
+    )
+    return {
+        "path": str(image_path),
+        "color_hist": feature_bundle.color_hist.astype(np.float32, copy=False),
+        "keypoints": keypoints_to_points(feature_bundle.keypoints),
+        "descriptors": feature_bundle.descriptors.astype(np.float32, copy=False),
+        "image_shape": feature_bundle.image_shape,
+    }
+
+
+def _extract_query_record_task(image_path: Path, config) -> Dict[str, object]:
+    return extract_query_record(image_path, config)
+
+
+def extract_query_records(image_paths: Sequence[Path], config, num_workers: int, chunksize: int) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    requested_workers = max(1, int(num_workers))
+    num_workers = effective_feature_worker_count(config, requested_workers)
+    chunksize = max(1, int(chunksize))
+
+    if num_workers != requested_workers:
+        print(
+            f"检测到 cudasift 后端，查询特征提取 worker 从 {requested_workers} 调整为 {num_workers}，"
+            "避免多进程同时占用 GPU 导致显存溢出。"
+        )
+
+    if num_workers == 1 or len(image_paths) <= 1:
+        for image_path in tqdm(image_paths, desc="提取查询特征", unit="img"):
+            records.append(extract_query_record(image_path, config))
+    else:
+        executor_kwargs = {"max_workers": num_workers}
+        if should_use_spawn_for_feature_workers(config):
+            executor_kwargs["mp_context"] = mp.get_context("spawn")
+        with ProcessPoolExecutor(**executor_kwargs) as executor:
+            iterator = executor.map(
+                _extract_query_record_task,
+                image_paths,
+                repeat(config),
+                chunksize=chunksize,
+            )
+            for record in tqdm(iterator, total=len(image_paths), desc="提取查询特征", unit="img"):
+                records.append(record)
+    return records
+
+
+def list_image_paths(image_dir: Path, recursive: bool = False) -> List[Path]:
+    pattern = "**/*" if recursive else "*"
+    return sorted(
+        [
+            path
+            for path in image_dir.glob(pattern)
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ],
+        key=lambda path: path.as_posix(),
+    )
 
 
 def save_partition_records(partition_dir: Path, filename: str, samples: Sequence) -> Path:
@@ -215,6 +381,7 @@ def evaluate_k_sweep(
     test_embeddings: np.ndarray,
     test_labels: Sequence[int],
     eval_ks: Iterable[int],
+    precomputed_indices: np.ndarray | None = None,
 ) -> Dict[str, object]:
     per_k: List[Dict[str, object]] = []
     best_accuracy: Dict[str, object] | None = None
@@ -228,6 +395,7 @@ def evaluate_k_sweep(
             test_embeddings=test_embeddings,
             test_labels=test_labels,
             top_k=k,
+            precomputed_indices=precomputed_indices,
         )
         record = {
             "k": int(k),
@@ -396,44 +564,39 @@ def run_train(args) -> None:
     vocabulary = kmeans.cluster_centers_.astype(np.float32)
 
     print("正在编码训练集 BoVW...")
-    train_bovw_features = encode_bovw_batch(
-        descriptor_sets=[record["descriptors"] for record in train_records],
-        keypoint_sets=[record["keypoints"] for record in train_records],
-        image_shapes=[record["image_shape"] for record in train_records],
+    train_color_features, train_bovw_features, train_embeddings = build_feature_matrices(
+        train_records,
         vocabulary=vocabulary,
-        min_weight=args.min_spatial_weight,
-        max_weight=args.max_spatial_weight,
-    )
-    train_color_features = np.vstack([record["color_hist"] for record in train_records]).astype(np.float32)
-    train_embeddings = fuse_features(
-        color_features=train_color_features,
-        bovw_features=train_bovw_features,
-        color_weight=args.color_weight,
-        bovw_weight=args.bovw_weight,
+        args=args,
     )
 
     print("正在提取测试集特征...")
     test_records = extract_records(test_samples, args, project_root=project_root)
-    test_bovw_features = encode_bovw_batch(
-        descriptor_sets=[record["descriptors"] for record in test_records],
-        keypoint_sets=[record["keypoints"] for record in test_records],
-        image_shapes=[record["image_shape"] for record in test_records],
+    _, test_bovw_features, test_embeddings = build_feature_matrices(
+        test_records,
         vocabulary=vocabulary,
-        min_weight=args.min_spatial_weight,
-        max_weight=args.max_spatial_weight,
-    )
-    test_color_features = np.vstack([record["color_hist"] for record in test_records]).astype(np.float32)
-    test_embeddings = fuse_features(
-        color_features=test_color_features,
-        bovw_features=test_bovw_features,
-        color_weight=args.color_weight,
-        bovw_weight=args.bovw_weight,
+        args=args,
     )
 
     print("正在建立 KNN 检索器并评估...")
-    knn_index = fit_knn_index(train_embeddings, metric=args.metric)
+    knn_index = build_knn_index(
+        train_embeddings=train_embeddings,
+        metric=args.metric,
+        backend=getattr(args, "knn_backend", "sklearn"),
+        torch_device=getattr(args, "torch_device", "auto"),
+        query_batch_size=getattr(args, "torch_query_batch_size", 256),
+    )
     train_labels = [record["sample"].label for record in train_records]
     test_labels = [record["sample"].label for record in test_records]
+    retrieval_top_ks = tuple(sorted({1, min(5, args.top_k)}))
+    eval_ks = None
+    if args.classifier == "knn":
+        eval_ks = parse_eval_ks(
+            raw_value=args.eval_ks,
+            max_allowed_k=min(args.max_eval_k, len(train_labels)),
+        )
+    max_precomputed_k = max([args.top_k, *retrieval_top_ks, *(eval_ks or [args.top_k])])
+    knn_distances, knn_indices = retrieve_neighbors(knn_index, test_embeddings, top_k=max_precomputed_k)
 
     svm_classifier = None
     if args.classifier in {"svm", "ensemble"}:
@@ -466,46 +629,52 @@ def run_train(args) -> None:
         top_k=args.top_k,
         svm_classifier=svm_classifier,
         rf_classifier=rf_classifier,
+        precomputed_distances=knn_distances,
+        precomputed_indices=knn_indices,
     )
     retrieval_metrics = evaluate_retrieval(
         index=knn_index,
         train_labels=train_labels,
         test_embeddings=test_embeddings,
         test_labels=test_labels,
-        top_ks=(1, min(5, args.top_k)),
+        top_ks=retrieval_top_ks,
+        precomputed_indices=knn_indices,
     )
     k_sweep_metrics = None
     if args.classifier == "knn":
-        eval_ks = parse_eval_ks(
-            raw_value=args.eval_ks,
-            max_allowed_k=min(args.max_eval_k, len(train_labels)),
-        )
         k_sweep_metrics = evaluate_k_sweep(
             index=knn_index,
             train_labels=train_labels,
             test_embeddings=test_embeddings,
             test_labels=test_labels,
             eval_ks=eval_ks,
+            precomputed_indices=knn_indices,
         )
         save_json(k_sweep_metrics, output_dir / "k_sweep_metrics.json")
         save_k_sweep_csv(k_sweep_metrics["per_k"], output_dir / "k_sweep_metrics.csv")
         plot_k_sweep(k_sweep_metrics["per_k"], output_dir / "k_sweep_accuracy_recall.png")
 
     classification_predictions = np.asarray(classification_metrics["predictions"], dtype=np.int32)
+    train_paths = [sample["sample"].relative_path for sample in train_records]
     retrieval_examples = []
-    for record, query_embedding, predicted_label in zip(
-        test_records, test_embeddings, classification_predictions
+    for record, predicted_label, row_distances, row_indices in zip(
+        test_records,
+        classification_predictions,
+        knn_distances,
+        knn_indices,
     ):
         prediction = build_prediction_payload(
             index=knn_index,
             train_embeddings=train_embeddings,
             train_labels=train_labels,
-            train_paths=[sample["sample"].relative_path for sample in train_records],
+            train_paths=train_paths,
             label_to_name=label_to_name,
-            query_embedding=query_embedding,
+            query_embedding=None,
             top_k=args.top_k,
             metric=args.metric,
             predicted_label=int(predicted_label),
+            precomputed_distances=row_distances,
+            precomputed_indices=row_indices,
         )
         retrieval_examples.append(
             {
@@ -585,34 +754,45 @@ def run_predict(args) -> None:
     preprocess_result = preprocess_image(
         image_path,
         max_side=namespace.max_side,
-        grabcut_margin_ratio=namespace.grabcut_margin_ratio,
-        grabcut_iter_count=namespace.grabcut_iter_count,
     )
     feature_bundle = extract_feature_bundle(
         preprocess_result.image_bgr,
-        foreground_mask=preprocess_result.foreground_mask,
         h_bins=namespace.h_bins,
         s_bins=namespace.s_bins,
         sift_nfeatures=namespace.sift_nfeatures,
         sift_contrast_threshold=namespace.sift_contrast_threshold,
         sift_edge_threshold=namespace.sift_edge_threshold,
         sift_sigma=namespace.sift_sigma,
+        sift_backend=getattr(namespace, "sift_backend", "opencv"),
+        cudasift_max_points=getattr(namespace, "cudasift_max_points", 32768),
+        cudasift_num_octaves=getattr(namespace, "cudasift_num_octaves", 5),
+        cudasift_lowest_scale=getattr(namespace, "cudasift_lowest_scale", 0.0),
+        cudasift_upscale=getattr(namespace, "cudasift_upscale", False),
     )
-    bovw = encode_weighted_bovw(
-        descriptors=feature_bundle.descriptors,
-        keypoints=feature_bundle.keypoints,
-        image_shape=feature_bundle.image_shape,
+    bovw = encode_bovw_batch(
+        descriptor_sets=[feature_bundle.descriptors],
+        keypoint_sets=[feature_bundle.keypoints],
+        image_shapes=[feature_bundle.image_shape],
         vocabulary=vocabulary,
         min_weight=namespace.min_spatial_weight,
         max_weight=namespace.max_spatial_weight,
-    )
+        backend=getattr(namespace, "bovw_backend", "numpy"),
+        torch_device=getattr(namespace, "torch_device", "auto"),
+        descriptor_chunk_size=getattr(namespace, "torch_descriptor_chunk_size", 8192),
+    )[0]
     embedding = fuse_features(
         color_features=feature_bundle.color_hist,
         bovw_features=bovw,
         color_weight=namespace.color_weight,
         bovw_weight=namespace.bovw_weight,
     )
-    knn_index = fit_knn_index(train_embeddings, metric=namespace.metric)
+    knn_index = build_knn_index(
+        train_embeddings=train_embeddings,
+        metric=namespace.metric,
+        backend=getattr(namespace, "knn_backend", "sklearn"),
+        torch_device=getattr(namespace, "torch_device", "auto"),
+        query_batch_size=getattr(namespace, "torch_query_batch_size", 256),
+    )
     predicted_label = int(
         predict_labels_by_classifier(
             classifier_name=classifier_name,
@@ -638,6 +818,91 @@ def run_predict(args) -> None:
     print(json.dumps(prediction, ensure_ascii=False, indent=2))
 
 
+def run_predict_batch(args) -> None:
+    project_root = Path(__file__).resolve().parent
+    image_dir = resolve_path(project_root, args.image_dir)
+    model_path = resolve_path(project_root, args.model)
+    output_path = resolve_path(project_root, args.output)
+
+    if not image_dir.exists():
+        raise FileNotFoundError(f"图片目录不存在: {image_dir}")
+
+    image_paths = list_image_paths(image_dir, recursive=args.recursive)
+    if not image_paths:
+        raise ValueError(f"未在目录中找到可处理图片: {image_dir}")
+
+    bundle = joblib.load(model_path)
+    config = argparse.Namespace(**bundle["config"])
+    vocabulary = np.asarray(bundle["vocabulary"], dtype=np.float32)
+    train_embeddings = np.asarray(bundle["train_embeddings"], dtype=np.float32)
+    train_labels = np.asarray(bundle["train_labels"], dtype=np.int32)
+    train_paths = bundle["train_paths"]
+    label_to_name = {int(k): v for k, v in bundle["label_to_name"].items()}
+    classifier_name = bundle.get("classifier_name", "knn")
+    classifier_artifacts = bundle.get("classifier_artifacts", {})
+
+    print(f"批量推理图片数: {len(image_paths)}")
+    query_records = extract_query_records(
+        image_paths=image_paths,
+        config=config,
+        num_workers=args.num_workers,
+        chunksize=args.chunksize,
+    )
+    predict_args = argparse.Namespace(**vars(config))
+    predict_args.num_workers = args.num_workers
+    predict_args.chunksize = args.chunksize
+    query_embeddings = build_embeddings(query_records, vocabulary=vocabulary, args=predict_args)
+    knn_index = build_knn_index(
+        train_embeddings=train_embeddings,
+        metric=config.metric,
+        backend=getattr(config, "knn_backend", "sklearn"),
+        torch_device=getattr(config, "torch_device", "auto"),
+        query_batch_size=getattr(config, "torch_query_batch_size", 256),
+    )
+    distances, indices = retrieve_neighbors(knn_index, query_embeddings, top_k=args.top_k)
+    predicted_labels = predict_labels_by_classifier(
+        classifier_name=classifier_name,
+        index=knn_index,
+        train_labels=train_labels,
+        query_embeddings=query_embeddings,
+        top_k=args.top_k,
+        svm_classifier=classifier_artifacts.get("svm"),
+        rf_classifier=classifier_artifacts.get("rf"),
+        precomputed_indices=indices,
+    )
+
+    predictions = []
+    for image_path, predicted_label, row_distances, row_indices in zip(
+        image_paths,
+        predicted_labels,
+        distances,
+        indices,
+    ):
+        payload = build_prediction_payload(
+            index=knn_index,
+            train_embeddings=train_embeddings,
+            train_labels=train_labels,
+            train_paths=train_paths,
+            label_to_name=label_to_name,
+            query_embedding=None,
+            top_k=args.top_k,
+            metric=config.metric,
+            predicted_label=int(predicted_label),
+            precomputed_distances=row_distances,
+            precomputed_indices=row_indices,
+        )
+        predictions.append(
+            {
+                "image": str(image_path),
+                **payload,
+            }
+        )
+
+    output_payload = {"predictions": predictions}
+    save_json(output_payload, output_path)
+    print(f"批量推理结果已保存到: {output_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Assign2 校园植被识别与检索系统")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -648,14 +913,17 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--test-size", type=float, default=0.3)
     train_parser.add_argument("--random-state", type=int, default=42)
     train_parser.add_argument("--max-side", type=int, default=960)
-    train_parser.add_argument("--grabcut-margin-ratio", type=float, default=0.1)
-    train_parser.add_argument("--grabcut-iter-count", type=int, default=5)
     train_parser.add_argument("--h-bins", type=int, default=30)
     train_parser.add_argument("--s-bins", type=int, default=32)
     train_parser.add_argument("--sift-nfeatures", type=int, default=0)
     train_parser.add_argument("--sift-contrast-threshold", type=float, default=0.04)
     train_parser.add_argument("--sift-edge-threshold", type=float, default=10.0)
     train_parser.add_argument("--sift-sigma", type=float, default=1.6)
+    train_parser.add_argument("--sift-backend", choices=["auto", "opencv", "cudasift"], default="auto")
+    train_parser.add_argument("--cudasift-max-points", type=int, default=32768)
+    train_parser.add_argument("--cudasift-num-octaves", type=int, default=5)
+    train_parser.add_argument("--cudasift-lowest-scale", type=float, default=0.0)
+    train_parser.add_argument("--cudasift-upscale", action="store_true")
     train_parser.add_argument("--num-words", type=int, default=300)
     train_parser.add_argument("--kmeans-batch-size", type=int, default=2048)
     train_parser.add_argument("--kmeans-max-iter", type=int, default=100)
@@ -691,6 +959,13 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--rf-n-estimators", type=int, default=300)
     train_parser.add_argument("--rf-max-depth", type=int, default=None)
     train_parser.add_argument("--rf-min-samples-leaf", type=int, default=1)
+    train_parser.add_argument("--num-workers", type=int, default=default_num_workers())
+    train_parser.add_argument("--chunksize", type=int, default=4)
+    train_parser.add_argument("--bovw-backend", choices=["numpy", "torch"], default="numpy")
+    train_parser.add_argument("--knn-backend", choices=["sklearn", "torch"], default="sklearn")
+    train_parser.add_argument("--torch-device", choices=["auto", "cpu", "cuda"], default="auto")
+    train_parser.add_argument("--torch-query-batch-size", type=int, default=256)
+    train_parser.add_argument("--torch-descriptor-chunk-size", type=int, default=8192)
     train_parser.set_defaults(func=run_train)
 
     predict_parser = subparsers.add_parser("predict", help="加载模型并预测单张图片")
@@ -698,6 +973,16 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--model", default="outputs/model_bundle.joblib")
     predict_parser.add_argument("--top-k", type=int, default=5)
     predict_parser.set_defaults(func=run_predict)
+
+    predict_batch_parser = subparsers.add_parser("predict-batch", help="批量预测目录中的图片")
+    predict_batch_parser.add_argument("--image-dir", required=True)
+    predict_batch_parser.add_argument("--model", default="outputs/model_bundle.joblib")
+    predict_batch_parser.add_argument("--top-k", type=int, default=5)
+    predict_batch_parser.add_argument("--output", default="outputs/predictions.json")
+    predict_batch_parser.add_argument("--recursive", action="store_true")
+    predict_batch_parser.add_argument("--num-workers", type=int, default=default_num_workers())
+    predict_batch_parser.add_argument("--chunksize", type=int, default=4)
+    predict_batch_parser.set_defaults(func=run_predict_batch)
 
     return parser
 

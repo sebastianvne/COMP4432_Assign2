@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Sequence, Tuple
 
 import cv2
 import numpy as np
+
+try:
+    import cudasift
+except Exception as exc:  # pragma: no cover - optional dependency
+    cudasift = None
+    _CUDASIFT_IMPORT_ERROR = exc
+else:
+    _CUDASIFT_IMPORT_ERROR = None
 
 
 @dataclass
 class FeatureBundle:
     color_hist: np.ndarray
-    keypoints: List[cv2.KeyPoint]
+    keypoints: Sequence[cv2.KeyPoint] | np.ndarray
     descriptors: np.ndarray
     image_shape: Tuple[int, int]
 
 
 def extract_hs_histogram(
     image_bgr: np.ndarray,
-    mask: np.ndarray | None = None,
     h_bins: int = 30,
     s_bins: int = 32,
 ) -> np.ndarray:
@@ -25,7 +32,7 @@ def extract_hs_histogram(
     hist = cv2.calcHist(
         [hsv],
         [0, 1],
-        mask,
+        None,
         [h_bins, s_bins],
         [0, 180, 0, 256],
     )
@@ -52,14 +59,25 @@ def create_sift(
     )
 
 
-def extract_sift_descriptors(
+def resolve_sift_backend(backend: str) -> str:
+    normalized = backend.lower()
+    if normalized == "auto":
+        return "cudasift" if cudasift is not None else "opencv"
+    if normalized == "cudasift" and cudasift is None:
+        detail = f" 原始错误: {_CUDASIFT_IMPORT_ERROR}" if _CUDASIFT_IMPORT_ERROR is not None else ""
+        raise RuntimeError(f"请求使用 cudasift，但当前环境不可用。{detail}")
+    if normalized not in {"opencv", "cudasift"}:
+        raise ValueError(f"不支持的 SIFT 后端: {backend}")
+    return normalized
+
+
+def extract_sift_descriptors_opencv(
     image_bgr: np.ndarray,
-    mask: np.ndarray | None = None,
     nfeatures: int = 0,
     contrast_threshold: float = 0.04,
     edge_threshold: float = 10.0,
     sigma: float = 1.6,
-) -> Tuple[List[cv2.KeyPoint], np.ndarray]:
+) -> Tuple[list[cv2.KeyPoint], np.ndarray]:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     sift = create_sift(
         nfeatures=nfeatures,
@@ -67,7 +85,7 @@ def extract_sift_descriptors(
         edge_threshold=edge_threshold,
         sigma=sigma,
     )
-    keypoints, descriptors = sift.detectAndCompute(gray, mask)
+    keypoints, descriptors = sift.detectAndCompute(gray, None)
 
     if keypoints is None:
         keypoints = []
@@ -79,29 +97,119 @@ def extract_sift_descriptors(
     return list(keypoints), descriptors
 
 
+def extract_sift_descriptors_cudasift(
+    image_bgr: np.ndarray,
+    nfeatures: int = 0,
+    contrast_threshold: float = 0.04,
+    edge_threshold: float = 10.0,
+    sigma: float = 1.6,
+    cudasift_max_points: int = 32768,
+    cudasift_num_octaves: int = 5,
+    cudasift_lowest_scale: float = 0.0,
+    cudasift_upscale: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    del edge_threshold  # CudaSift 不提供与 OpenCV 完全等价的 edge threshold 参数。
+
+    if cudasift is None:
+        detail = f" 原始错误: {_CUDASIFT_IMPORT_ERROR}" if _CUDASIFT_IMPORT_ERROR is not None else ""
+        raise RuntimeError(f"cudasift 不可用。{detail}")
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    max_points = max(int(cudasift_max_points), int(nfeatures) if nfeatures > 0 else 0, 1)
+    sift_data = cudasift.PySiftData(max_points)
+
+    # CudaSift 的阈值量纲与 OpenCV 不同，这里做保守映射，便于复用现有参数。
+    thresh = float(max(1.0, contrast_threshold * 100.0))
+    cudasift.ExtractKeypoints(
+        gray,
+        sift_data,
+        numOctaves=int(cudasift_num_octaves),
+        initBlur=float(max(0.0, sigma)),
+        thresh=thresh,
+        lowestScale=float(max(0.0, cudasift_lowest_scale)),
+        upScale=bool(cudasift_upscale),
+    )
+    keypoint_df, descriptors = sift_data.to_data_frame()
+    if len(keypoint_df) == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 128), dtype=np.float32)
+
+    keypoints = keypoint_df[["xpos", "ypos"]].to_numpy(dtype=np.float32, copy=True)
+    descriptors = np.asarray(descriptors, dtype=np.float32)
+
+    if nfeatures > 0 and len(keypoints) > nfeatures:
+        scores = keypoint_df["sharpness"].to_numpy(dtype=np.float32, copy=False)
+        keep = np.argsort(scores)[-nfeatures:]
+        keypoints = keypoints[keep]
+        descriptors = descriptors[keep]
+
+    return keypoints.reshape(-1, 2), descriptors.reshape(-1, 128)
+
+
+def extract_sift_descriptors(
+    image_bgr: np.ndarray,
+    nfeatures: int = 0,
+    contrast_threshold: float = 0.04,
+    edge_threshold: float = 10.0,
+    sigma: float = 1.6,
+    backend: str = "auto",
+    cudasift_max_points: int = 32768,
+    cudasift_num_octaves: int = 5,
+    cudasift_lowest_scale: float = 0.0,
+    cudasift_upscale: bool = False,
+) -> Tuple[Sequence[cv2.KeyPoint] | np.ndarray, np.ndarray]:
+    resolved_backend = resolve_sift_backend(backend)
+    if resolved_backend == "cudasift":
+        return extract_sift_descriptors_cudasift(
+            image_bgr=image_bgr,
+            nfeatures=nfeatures,
+            contrast_threshold=contrast_threshold,
+            edge_threshold=edge_threshold,
+            sigma=sigma,
+            cudasift_max_points=cudasift_max_points,
+            cudasift_num_octaves=cudasift_num_octaves,
+            cudasift_lowest_scale=cudasift_lowest_scale,
+            cudasift_upscale=cudasift_upscale,
+        )
+    return extract_sift_descriptors_opencv(
+        image_bgr=image_bgr,
+        nfeatures=nfeatures,
+        contrast_threshold=contrast_threshold,
+        edge_threshold=edge_threshold,
+        sigma=sigma,
+    )
+
+
 def extract_feature_bundle(
     image_bgr: np.ndarray,
-    foreground_mask: np.ndarray | None = None,
     h_bins: int = 30,
     s_bins: int = 32,
     sift_nfeatures: int = 0,
     sift_contrast_threshold: float = 0.04,
     sift_edge_threshold: float = 10.0,
     sift_sigma: float = 1.6,
+    sift_backend: str = "auto",
+    cudasift_max_points: int = 32768,
+    cudasift_num_octaves: int = 5,
+    cudasift_lowest_scale: float = 0.0,
+    cudasift_upscale: bool = False,
 ) -> FeatureBundle:
     color_hist = extract_hs_histogram(
         image_bgr,
-        mask=foreground_mask,
         h_bins=h_bins,
         s_bins=s_bins,
     )
     keypoints, descriptors = extract_sift_descriptors(
         image_bgr,
-        mask=foreground_mask,
         nfeatures=sift_nfeatures,
         contrast_threshold=sift_contrast_threshold,
         edge_threshold=sift_edge_threshold,
         sigma=sift_sigma,
+        backend=sift_backend,
+        cudasift_max_points=cudasift_max_points,
+        cudasift_num_octaves=cudasift_num_octaves,
+        cudasift_lowest_scale=cudasift_lowest_scale,
+        cudasift_upscale=cudasift_upscale,
     )
     return FeatureBundle(
         color_hist=color_hist,

@@ -8,3 +8,5 @@ src/__pycache__/
 .ipynb_checkpoints/
 /dataset_large_jpg/
 feature/
+dataset/
+dataset_augmented/
