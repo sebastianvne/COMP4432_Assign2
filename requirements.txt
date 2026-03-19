@@ -1,5 +1,7 @@
 joblib
 numpy
 opencv-python-headless
+pillow
+pillow-heif
 scikit-learn
 tqdm
